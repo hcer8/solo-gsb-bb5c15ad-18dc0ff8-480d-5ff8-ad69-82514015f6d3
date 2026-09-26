@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -262,10 +263,25 @@ app.get('/api/scripts/:id/versions/:version', (req, res) => {
 });
 
 /**
+ * 恢复预览的提示校验凭据：对该剧本当前全部提示的集合与迁移相关状态
+ * （每条提示的类型/内容/备注、素材关联、锚点与上下文快照、绑定状态、行号、
+ * 待确认原因等——即重定位演算的全部输入与提示展示字段）计算 SHA-256 摘要。
+ * 任一窗口新增、删除、改绑或修改提示都会改变凭据；预览与恢复共用本函数，
+ * 恢复提交时在事务内重算比对，不一致即视为预览过期（409）。
+ */
+function cuesFingerprint(scriptId) {
+  const rows = db
+    .prepare('SELECT * FROM cues WHERE script_id = ? ORDER BY id')
+    .all(scriptId);
+  return crypto.createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+}
+
+/**
  * 版本回溯预览（只读，不改任何数据）：
  * 对「把当前全部提示迁移到目标版本正文」执行与保存新版完全相同的重定位演算，
  * 返回迁移后的已绑定/待确认数量，以及待确认提示的原因与候选行，供确认前人工评估。
- * 预览响应携带 current_version：恢复提交时必须原样带回，用于乐观锁校验。
+ * 预览响应携带 current_version 与 cue_token（提示集合校验凭据）：
+ * 恢复提交时必须原样带回，用于乐观锁校验——版本号或提示集合任一变化都会使预览过期。
  */
 app.get('/api/scripts/:id/versions/:version/restore-preview', (req, res) => {
   const script = getScriptOr404(req.params.id);
@@ -302,6 +318,8 @@ app.get('/api/scripts/:id/versions/:version/restore-preview', (req, res) => {
   res.json({
     script_id: script.id,
     current_version: script.current_version,
+    // 提示集合校验凭据：确认恢复时原样提交，服务端在事务内重算比对
+    cue_token: cuesFingerprint(script.id),
     target_version: version,
     total: stats.total,
     bound: stats.bound,
@@ -312,8 +330,10 @@ app.get('/api/scripts/:id/versions/:version/restore-preview', (req, res) => {
 
 /**
  * 恢复历史版本：
- *  1. 请求必须携带预览时的当前版本号 expectedCurrentVersion；事务内重新读取当前版本，
- *     若另一窗口已改版（版本号不一致），返回 409 要求重新预览，绝不覆盖新内容；
+ *  1. 请求必须携带预览时的当前版本号 expectedCurrentVersion 与提示校验凭据
+ *     expectedCueToken；事务内重新读取当前版本并重算提示凭据——
+ *     若另一窗口已改版（版本号不一致），或已新增/删除/改绑/修改提示（凭据不一致），
+ *     返回 409 要求重新预览，绝不生成新版本、也不改动任何提示；
  *  2. 目标历史快照原样保留、不被改动：其正文会另存为一个递增的新版本；
  *  3. 同一事务内按现有重定位规则把当前提示迁移到该正文——重复台词无法唯一定位时
  *     保持待确认并附候选行，绝不会静默挂到另一句相同台词上。
@@ -328,12 +348,23 @@ app.post('/api/scripts/:id/versions/:version/restore', (req, res) => {
   if (!Number.isInteger(expectedCurrent) || expectedCurrent <= 0) {
     return res.status(400).json({ error: '缺少预览时的当前版本号 expectedCurrentVersion' });
   }
+  const expectedCueToken = req.body.expectedCueToken;
+  if (typeof expectedCueToken !== 'string' || !expectedCueToken) {
+    return res.status(400).json({ error: '缺少预览时的提示校验凭据 expectedCueToken' });
+  }
 
   const outcome = db.transaction(() => {
     const cur = db.prepare('SELECT * FROM scripts WHERE id = ?').get(script.id);
     if (cur.current_version !== expectedCurrent) {
       throw conflict(
         `剧本已在其他窗口改版（预览时为第 ${expectedCurrent} 版，当前为第 ${cur.current_version} 版），请重新预览后再恢复`
+      );
+    }
+    // 版本号未变也不能说明提示没动过：另一窗口可能只增删/改绑/修改了提示，
+    // 凭据不一致即预览所依据的提示集合已变化，按过期处理（整笔回滚，不写任何内容）
+    if (cuesFingerprint(script.id) !== expectedCueToken) {
+      throw conflict(
+        '该剧本的提示已在其他窗口变化（新增/删除/修改/改绑），迁移预览已过期，请重新预览后再恢复'
       );
     }
     const target = getVersionOr404(script.id, version);

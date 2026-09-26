@@ -2284,7 +2284,8 @@ function renderRestorePanel() {
       <p class="hint" style="margin:6px 0">
         恢复不会覆盖或删除任何历史快照：该版正文会被<strong>另存为递增的新版本</strong>，
         当前提示则在同一事务内按既有重定位规则迁移；无法唯一定位的台词仍会保持待确认并给出候选行。
-        提交时会校验预览时的当前版本号，若另一窗口已改版将返回冲突、要求重新预览。
+        提交时会校验预览时的当前版本号与提示集合凭据，若另一窗口已改版或增删/改绑/修改过提示，
+        将返回冲突、要求重新预览。
       </p>
       <div class="restore-actions">
         <button class="btn btn-primary" id="restorePreviewBtn">预览提示迁移结果</button>
@@ -2406,7 +2407,8 @@ $('restoreBox').addEventListener('click', async (e) => {
       const r = await api(
         'POST',
         `/api/scripts/${state.script.id}/versions/${vs.selected.version}/restore`,
-        { expectedCurrentVersion: p.current_version }
+        // 预览时的当前版本号与提示集合校验凭据原样带回，服务端事务内复核
+        { expectedCurrentVersion: p.current_version, expectedCueToken: p.cue_token }
       );
       // 恢复成功：重新拉取剧本（正文/版本号/提示均已变），切回版本回溯并选中新版本
       await openScript(state.script.id);
@@ -2424,8 +2426,10 @@ $('restoreBox').addEventListener('click', async (e) => {
     } catch (err) {
       vs.busy = false;
       if (err.status === 409) {
-        // 另一窗口已改版：同步服务端当前状态，旧预览作废，必须重新预览后才能再次确认
+        // 另一窗口已改版或增删/改绑/修改过提示：旧预览立即作废清除，
+        // 同步服务端当前状态后回到「重新预览」入口，必须重新预览才能再次确认
         toast(`冲突：${err.message}`, true);
+        state.versions.preview = null;
         state.script = await api('GET', `/api/scripts/${state.script.id}`);
         await loadVersionsTab();
       } else {
