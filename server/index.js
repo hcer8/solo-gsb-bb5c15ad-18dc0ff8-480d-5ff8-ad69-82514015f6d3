@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
@@ -236,6 +237,43 @@ function getVersionOr404(scriptId, version) {
   return row;
 }
 
+/**
+ * 计算某剧本「提示集合 + 迁移相关状态」的校验凭据（SHA-256，hex）。
+ * 覆盖 relocalize 重定位演算所依赖的全部提示字段（锚点文本、前后上下文）以及提示集合本身
+ * （id 列表的增删）和其余当前状态（类型/文案/备注/素材关联/绑定状态/行号/待确认原因）：
+ * 另一窗口新增、删除、改绑或修改任一提示都会令凭据变化。
+ * 时间戳（created_at/updated_at）刻意不计入——同一集合仅被改时间不应视为集合变化。
+ * 须在事务内（或与版本读取同一事务内）调用，保证与版本号的一致性判断。
+ */
+const CUE_CREDENTIAL_COLS = [
+  'id',
+  'type',
+  'label',
+  'note',
+  'asset_id',
+  'version',
+  'line_no',
+  'line_text',
+  'anchor_index',
+  'anchor_text',
+  'context_before',
+  'context_after',
+  'anchor_status',
+  'issue_type',
+  'issue_detail',
+];
+
+function cueSetToken(scriptId) {
+  const rows = db
+    .prepare(
+      `SELECT ${CUE_CREDENTIAL_COLS.join(', ')}
+       FROM cues WHERE script_id = ? ORDER BY id`
+    )
+    .all(scriptId);
+  const payload = JSON.stringify(rows.map((r) => CUE_CREDENTIAL_COLS.map((c) => r[c])));
+  return crypto.createHash('sha256').update(payload).digest('hex');
+}
+
 // 版本列表：版本号、保存时间（不含正文），标注当前版本
 app.get('/api/scripts/:id/versions', (req, res) => {
   const script = getScriptOr404(req.params.id);
@@ -265,7 +303,10 @@ app.get('/api/scripts/:id/versions/:version', (req, res) => {
  * 版本回溯预览（只读，不改任何数据）：
  * 对「把当前全部提示迁移到目标版本正文」执行与保存新版完全相同的重定位演算，
  * 返回迁移后的已绑定/待确认数量，以及待确认提示的原因与候选行，供确认前人工评估。
- * 预览响应携带 current_version：恢复提交时必须原样带回，用于乐观锁校验。
+ * 预览响应携带两道乐观锁凭据，恢复提交时必须原样带回：
+ *  - current_version：预览时的剧本当前版本号；
+ *  - cue_token：覆盖提示集合及迁移相关状态（锚点/上下文/绑定状态等）的校验凭据，
+ *    另一窗口新增/删除/改绑/修改提示都会使其失效（这些操作本身不改变剧本版本号）。
  */
 app.get('/api/scripts/:id/versions/:version/restore-preview', (req, res) => {
   const script = getScriptOr404(req.params.id);
@@ -274,46 +315,57 @@ app.get('/api/scripts/:id/versions/:version/restore-preview', (req, res) => {
     return res.status(400).json({ error: '版本号非法' });
   }
   const target = getVersionOr404(script.id, version);
-  if (version === script.current_version) {
-    return res
-      .status(400)
-      .json({ error: `第 ${version} 版就是当前版本，无需恢复` });
-  }
 
-  const cues = db.prepare('SELECT * FROM cues WHERE script_id = ?').all(script.id);
-  const { results, stats } = relocalize(cues, target.content);
-  const cueById = new Map(cues.map((c) => [c.id, c]));
-  const pending = [];
-  for (const r of results) {
-    if (r.status !== 'pending') continue;
-    const c = cueById.get(r.cueId);
-    pending.push({
-      cue_id: r.cueId,
-      type: c ? c.type : null,
-      label: c ? c.label : '',
-      note: c ? c.note : '',
-      anchor_text: c ? c.anchor_text : null,
-      issue_type: r.issueType,
-      issue_detail: r.issueDetail,
-      candidates: r.candidates || [],
-    });
-  }
+  // 在同一只读事务内读取当前版本与提示并演算、计算凭据，保证三者取自同一快照
+  const preview = db.transaction(() => {
+    const currentVersion = db
+      .prepare('SELECT current_version FROM scripts WHERE id = ?')
+      .get(script.id).current_version;
+    if (version === currentVersion) {
+      const e = new Error(`第 ${version} 版就是当前版本，无需恢复`);
+      e.status = 400;
+      throw e;
+    }
+    const cues = db.prepare('SELECT * FROM cues WHERE script_id = ?').all(script.id);
+    const token = cueSetToken(script.id);
+    const { results, stats } = relocalize(cues, target.content);
+    const cueById = new Map(cues.map((c) => [c.id, c]));
+    const pending = [];
+    for (const r of results) {
+      if (r.status !== 'pending') continue;
+      const c = cueById.get(r.cueId);
+      pending.push({
+        cue_id: r.cueId,
+        type: c ? c.type : null,
+        label: c ? c.label : '',
+        note: c ? c.note : '',
+        anchor_text: c ? c.anchor_text : null,
+        issue_type: r.issueType,
+        issue_detail: r.issueDetail,
+        candidates: r.candidates || [],
+      });
+    }
+    return { currentVersion, token, stats, pending };
+  })();
 
   res.json({
     script_id: script.id,
-    current_version: script.current_version,
+    current_version: preview.currentVersion,
+    cue_token: preview.token,
     target_version: version,
-    total: stats.total,
-    bound: stats.bound,
-    pending: stats.pending,
-    pending_cues: pending,
+    total: preview.stats.total,
+    bound: preview.stats.bound,
+    pending: preview.stats.pending,
+    pending_cues: preview.pending,
   });
 });
 
 /**
  * 恢复历史版本：
- *  1. 请求必须携带预览时的当前版本号 expectedCurrentVersion；事务内重新读取当前版本，
- *     若另一窗口已改版（版本号不一致），返回 409 要求重新预览，绝不覆盖新内容；
+ *  1. 请求必须原样携带预览时的两道凭据：当前版本号 expectedCurrentVersion 与提示集合凭据
+ *     expectedCueToken；事务内重新读取并同时复核——剧本已改版（版本号不一致），或另一窗口
+ *     在不改版本号的情况下新增/删除/改绑/修改了提示（凭据不一致），均返回 409 要求重新预览，
+ *     绝不生成新版本、绝不改动任何提示（整笔事务回滚）；
  *  2. 目标历史快照原样保留、不被改动：其正文会另存为一个递增的新版本；
  *  3. 同一事务内按现有重定位规则把当前提示迁移到该正文——重复台词无法唯一定位时
  *     保持待确认并附候选行，绝不会静默挂到另一句相同台词上。
@@ -328,12 +380,25 @@ app.post('/api/scripts/:id/versions/:version/restore', (req, res) => {
   if (!Number.isInteger(expectedCurrent) || expectedCurrent <= 0) {
     return res.status(400).json({ error: '缺少预览时的当前版本号 expectedCurrentVersion' });
   }
+  const expectedCueToken =
+    typeof req.body.expectedCueToken === 'string' ? req.body.expectedCueToken.trim() : '';
+  if (!/^[a-f0-9]{64}$/.test(expectedCueToken)) {
+    return res
+      .status(400)
+      .json({ error: '缺少预览时的提示集合校验凭据 expectedCueToken，请先重新预览' });
+  }
 
   const outcome = db.transaction(() => {
     const cur = db.prepare('SELECT * FROM scripts WHERE id = ?').get(script.id);
     if (cur.current_version !== expectedCurrent) {
       throw conflict(
         `剧本已在其他窗口改版（预览时为第 ${expectedCurrent} 版，当前为第 ${cur.current_version} 版），请重新预览后再恢复`
+      );
+    }
+    const currentCueToken = cueSetToken(script.id);
+    if (currentCueToken !== expectedCueToken) {
+      throw conflict(
+        '同一剧本的提示在预览后已被其他窗口新增、删除、改绑或修改，迁移结果可能与预览不符，请重新预览后再恢复'
       );
     }
     const target = getVersionOr404(script.id, version);
